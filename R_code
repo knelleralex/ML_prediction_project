@@ -1,0 +1,272 @@
+# student name : Alex Kneller
+
+##################
+# Initialization #
+##################
+rm(list = ls()) # :) remove all variables from global environment
+cat("\014") # clear the screen
+
+library("randomForest")
+library("FSelector")
+library("CORElearn")
+set.seed(579)
+
+#import data
+train = read.csv("ffp_data.csv")
+rvw = read.csv("reviews_data.csv")
+rollout = read.csv("ffp_rollout.csv")
+rvw_rollout  = read.csv("reviews_rollout.csv")
+
+#make sure no missing values
+var_na = colSums(is.na(train))
+sum(var_na)
+var_na1 = colSums(is.na(rvw))
+sum(var_na1)
+var_na2 = colSums(is.na(rollout))
+sum(var_na2)
+var_na3 = colSums(is.na(rvw_rollout))
+sum(var_na3)
+
+# constant vars
+cost = 33
+revenue = 210.5
+profit = revenue-cost
+
+#benchmark 1 - target none: profit = 0
+#benchmark 2 - target all
+
+bench_profit = sum((train$BUYER_FLAG==1)*profit - (train$BUYER_FLAG==0)*cost)
+
+#targeting all gives negative profit. so benchmark 2 is irrelevant
+
+colnum = ncol(train)
+rownum = nrow(train)
+
+#normalize columns 
+maxs = c(1)
+for (i1 in 2:(colnum-1))
+{
+  maxs[i1] = max(train[,i1])
+}
+
+for (j2 in 2:(colnum-1))
+{
+  for (j1 in 1:rownum)
+  {
+    train[j1,j2] = train[j1,j2]/maxs[j2]
+  }
+}
+
+#selection by information gain
+#IG = information.gain(BUYER_FLAG~.,train)
+IG = attrEval(BUYER_FLAG ~ ., data=train,  estimator = "InfGain")
+#IG[1,1]=0
+
+col_criteria = c(IG>0.001,TRUE)
+col_criteria[1] = TRUE
+
+main_train = train[c(col_criteria)]
+
+####################################
+# PART 2: INTEGRATE REVIEWS        #
+# (using sentiment analysis model) #
+####################################
+
+file_path = file.path(getwd(),"text_train.csv")
+check1 = read.csv(file_path, na.strings="") 
+
+check1 <-check1[complete.cases(check1),]
+
+colnum2 = ncol(check1)
+rownum2 = nrow(check1)
+
+
+############################
+# Benchmark - ALL POSITIVE #
+############################
+BENCH_SCORE = sum(check1$rating)*100/rownum2
+
+#find most relevant vars using correlation to target
+cors = c()
+cors[1]=1
+for (i in 2:(colnum2-1))
+{
+  if (sum(check1[,i])==0)
+  {
+    cors[i]=0
+  }
+  else
+  {
+    cors[i] = cor(check1[,i],check1[,2002])
+    
+  }
+}
+#absolute value
+x = abs(cors)
+
+var_criteria = c(x>0.07)
+
+main_data = check1[,c(var_criteria)]
+
+#prepare for Kfold cross validation
+
+K2 = 4 
+n_tr = nrow(main_data)       
+G2 = sample(K2, n_tr, replace=TRUE) # assign each observation to a group between 1 to K
+results2 = data.frame()
+
+for(k2 in 1:K2){
+  # Split the train set into temporary test and train sets
+  indicator_test_fold2 = (G2==k2)
+  train_folds2 = main_data[!indicator_test_fold2,]
+  test_fold2   = main_data[indicator_test_fold2,]
+  # fit regression
+  cols2include2 = !(colnames(train_folds2) %in% "ID")
+  mdl2 = glm(rating ~ ., family = binomial,
+             data=train_folds2[,cols2include2])
+  # predict rating for the samples in test_part
+  y_hat2 = predict(mdl2, test_fold2, type="response")
+  y_hat2 = (y_hat2 > 0.5)
+  ## D. Evaluate the prediction according to your predefined evaluation 
+  ##    criteria
+  y2 = test_fold2$rating == 1
+  #conf matrix
+  tp2 = sum(((y_hat2==TRUE) & (y2==TRUE)))   # true positive
+  fp2 = sum(((y_hat2==TRUE) & (y2==FALSE)))  # false positive
+  fn2 = sum(((y_hat2==FALSE) & (y2==TRUE)))  # false negative
+  tn2 = sum(((y_hat2==FALSE) & (y2==FALSE))) # true negative
+  reg_accuracy = (tp2+tn2)/(tp2+tn2+fp2+fn2)
+  
+  ##  Store the results
+  results2[k2,"reg_accuracy"] = reg_accuracy
+}
+
+results2
+# interpretation: we see 85% chance of guessing correctly
+# whether the review is positive or negative.
+
+# train the chosen model (text sentiment) on all the data
+final_mdl2 = glm(rating ~ ., family = binomial,
+                 data=main_data[,cols2include2])
+
+# predict rating for reviews_data
+y_hat3 = predict(final_mdl2, rvw , type="response")
+y_hat3 = (y_hat3 > 0.5)
+
+#join rating to original main_training_data by "ID"
+rvw_predicted = cbind(ID = rvw$ID, rating = y_hat3)
+rvw_predicted = as.data.frame(rvw_predicted)
+main_train = merge(main_train , rvw_predicted , by = "ID" , all.x = TRUE)
+
+# turn negative response to -1 and NA to 0 
+# logic: capture full effect of model but don't interfere with non-responses
+main_train$rating[main_train$rating==0] = -1
+main_train$rating[is.na(main_train$rating)] = 0
+
+#####################################################
+######### END OF SPECIAL ADDITION (PART 2) ##########
+######### now we will add into main model  ##########
+#####################################################
+
+#prepare for Kfold cross validation
+K=4
+N_train = nrow(main_train)
+G = sample(K, N_train, replace=TRUE)
+results = data.frame()
+
+#predict with random forest
+for(k in 1:K){
+  ## A. Split the train set into temporary test and train sets
+  indicator_test_fold = (G==k)
+  train_folds = main_train[!indicator_test_fold,]
+  test_fold   = main_train[indicator_test_fold,]
+  ## B. Fit a classifier using the subset data named train_folds 
+  ## * Discard the "ID" column 
+  cols2include = !(colnames(train_folds) %in% "ID")
+  mdl = randomForest(BUYER_FLAG ~ ., 
+            data=train_folds[,cols2include], ntree=100)
+  ## C. predict the class labels for the samples in test_part
+  y_hat = predict(mdl, test_fold, type="response")
+  y_hat = (y_hat > 0.2)
+  ## D. Evaluate the prediction according to your predefined evaluation 
+  ##    criteria
+  y = test_fold$BUYER_FLAG == 1
+  # Calculating the confusion matrix manually
+  tp = sum(((y_hat==TRUE) & (y==TRUE)))   # true positive
+  fp = sum(((y_hat==TRUE) & (y==FALSE)))  # false positive
+  profits = tp*profit
+  losses = fp*cost
+  net = tp*profit-fp*cost
+
+  ## E. Store the results
+  results[k,"tp"] = tp
+  results[k,"fp"] = fp
+  results[k,"profits"] = profits
+  results[k,"losses"] = losses
+  results[k,"net"] = net
+  
+} # end for K-CV
+results
+
+ave(results$net)[1]
+
+#average profit per customer in test_data
+ave(results$net)[1]/nrow(test_fold)
+
+# total potential profits if we apply this model 
+# on 2.1 million customer database:
+2100000*ave(results$net)[1]/nrow(test_fold)
+
+##############################################
+# FINAL PART: TRAINING ON ALL THE TRAIN_DATA #
+# AND SUBMITTING RECOMMENDATIONS             #
+##############################################
+
+# predict rating for review rollout
+y_hat4 = predict(final_mdl2, rvw_rollout , type="response")
+y_hat4 = (y_hat4 > 0.5)
+
+# normalize ffp_rollout
+colnum3 = ncol(rollout)
+rownum3 = nrow(rollout)
+
+maxs3 = c(1)
+for (i3 in 2:(colnum3-1))
+{
+  maxs3[i3] = max(rollout[,i3])
+}
+
+for (j4 in 2:(colnum3-1))
+{
+  for (j3 in 1:rownum3)
+  {
+    rollout[j3,j4] = rollout[j3,j4]/maxs3[j4]
+  }
+}
+
+# left join the review_rollout ratings to the ffp_rollout
+rvw_predicted2 = cbind(ID = rvw_rollout$ID, rating = y_hat4)
+rvw_predicted2 = as.data.frame(rvw_predicted2)
+new_rollout = merge(rollout , rvw_predicted2 , by = "ID" , all.x = TRUE)
+
+# turn negative response to -1 and NA to 0 
+# logic: capture full effect of model but don't interfere with non-responses
+new_rollout$rating[new_rollout$rating==0] = -1
+new_rollout$rating[is.na(new_rollout$rating)] = 0
+
+# train main model on all train_set 
+final_mdl = randomForest(BUYER_FLAG ~ ., 
+                   data=main_train[,cols2include], ntree=100)
+
+# predict 
+y_hat5 = predict(final_mdl, new_rollout, type="response")
+y_hat5 = (y_hat5 > 0.2)
+
+#export to CSV
+rollout_ID = 30001:40000
+rollout_BF = y_hat5*1
+write.csv( cbind(ID=rollout_ID, BUYER_FLAG=rollout_BF),
+           "recommendations.csv",
+           row.names = FALSE)
+
+
